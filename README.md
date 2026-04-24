@@ -89,3 +89,18 @@ npm install
 npm run build
 npm test
 ```
+
+## MCP server (stdio)
+
+This repository also ships a local MCP server entrypoint that wraps core switch
+discovery/configuration operations with tool calls.
+
+```bash
+npm install
+npm run build
+npm run mcp:start
+```
+
+The MCP server name is `tplink-mcp-server` and includes tool names prefixed with
+`tplink_` (for example `tplink_discover_switches`, `tplink_get_switch_info`,
+`tplink_get_full_config`, `tplink_set_vlan`, and `tplink_save_config`).
