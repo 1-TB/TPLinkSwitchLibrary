@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { SwitchClient } from '../src/client.js';
+import { SessionCleanupError, SwitchClient } from '../src/client.js';
 import { assembleFragments, assemblePacket, packHeader, PACKET_END, serializeString, splitPacket, unpackTlvs } from '../src/protocol.js';
 import { RSA_OK } from '../src/session.js';
 import { OpCode, PacketHeader, SecurityPreference, TlvEntry, TlvType } from '../src/types.js';
@@ -184,6 +184,43 @@ describe('backupConfig', () => {
     expect((await c.backupConfig()).toString()).toBe('OLD');
     expect((await c.backupConfig()).toString()).toBe('OLD');
     expect(sentRsaKeys(fake)).toEqual([130, 10]);
+  });
+
+  it('returns the config on a SessionCleanupError when the session clear fails', async () => {
+    const sw = rsaSwitch({ acceptBig: true, config: [Buffer.from('CFG')] });
+    let clears = 0;
+    const fake = new FakeTransport((req) => {
+      const rsa = req.tlvs.find((t) => t.type === TlvType.RSA_KEY);
+      if (rsa && rsa.value.length === 0) {
+        clears++;
+        return 'timeout';
+      }
+      return sw.handler(req);
+    });
+    const c = client(fake);
+    await c.login();
+    const err = await c.backupConfig().then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(SessionCleanupError);
+    expect((err as SessionCleanupError).config.toString()).toBe('CFG');
+    expect((err as SessionCleanupError).message).toMatch(/closing the temporary RSA session failed/);
+    expect(clears).toBe(1);
+    // Local state is reset even though the switch never ACKed the clear.
+    expect(c.securityMode).toBe('legacy');
+  });
+
+  it('keeps the export error when the cleanup fails too', async () => {
+    const sw = rsaSwitch({ acceptBig: true });
+    const fake = new FakeTransport((req) => {
+      const rsa = req.tlvs.find((t) => t.type === TlvType.RSA_KEY);
+      if (rsa && rsa.value.length === 0) return 'timeout';
+      return sw.handler(req);
+    });
+    const c = client(fake);
+    await c.login();
+    await expect(c.backupConfig()).rejects.toThrow(/no data TLV/);
   });
 
   it('clears the temporary session even when the export fails', async () => {

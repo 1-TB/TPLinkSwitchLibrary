@@ -1,4 +1,4 @@
-export { SwitchClient } from './client.js';
+export { SwitchClient, SessionCleanupError } from './client.js';
 export { UdpTransport, resolveInterface } from './transport.js';
 export { discoverSwitches } from './discovery.js';
 export { encode, decode } from './cipher.js';

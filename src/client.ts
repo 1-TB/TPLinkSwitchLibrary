@@ -79,6 +79,22 @@ const FRAGMENT_SETTLE_MS = 250;
 /** The switch adopted the session key but rejected the credentials. */
 class LoginRejectedError extends Error {}
 
+/**
+ * Thrown by backupConfig() when the config was downloaded but closing the
+ * temporary RSA session afterwards failed. The backup is still available on
+ * `config`; the switch may ignore legacy clients until its session times out.
+ */
+export class SessionCleanupError extends Error {
+  constructor(
+    message: string,
+    readonly config: Buffer,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = 'SessionCleanupError';
+  }
+}
+
 export class SwitchClient extends EventEmitter {
   private opts: Required<SwitchClientOptions>;
   private transport?: UdpTransport;
@@ -665,29 +681,59 @@ export class SwitchClient extends EventEmitter {
    * image). Requires a successful login(). On 2023+ firmware the export only
    * works over the RSA session transport: if login() didn't open one, this
    * opens a temporary session, and clears it and logs back in over the legacy
-   * transport afterwards, so the switch is never left session-locked.
+   * transport afterwards. If the export fails, that error is thrown even when
+   * the cleanup fails too. If the export succeeds but the cleanup fails, a
+   * SessionCleanupError carrying the downloaded config is thrown.
    * The reply arrives fragmented (fragmentOffset counts down to 0); the
    * transport waits for every fragment and throws if any is missing.
    */
   async backupConfig(): Promise<Buffer> {
     const temporary = !this.useSession() && (await this.startSession());
+    let config: Buffer;
     try {
-      await this.refreshToken();
-      const { tlvs } = await this.query(
-        OpCode.LOGIN,
-        [...this.loginTlvs(), { type: TlvType.SYSTEM_CONFIG_GET, value: Buffer.alloc(0) }],
-        this.useSession(),
-        FRAGMENT_SETTLE_MS,
-      );
-      const chunks = tlvs.filter((t) => t.type === TlvType.SYSTEM_CONFIG_GET).map((t) => t.value);
-      if (!chunks.length) throw new Error('config export: no data TLV in response');
-      return Buffer.concat(chunks);
-    } finally {
-      if (temporary) {
-        await this.logout();
-        await this.legacyLogin();
+      config = await this.exportConfig();
+    } catch (err) {
+      // Keep the export error; a cleanup failure must not replace it.
+      if (temporary) await this.endTemporarySession().catch(() => undefined);
+      throw err;
+    }
+    if (temporary) {
+      try {
+        await this.endTemporarySession();
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new SessionCleanupError(
+          `config downloaded, but closing the temporary RSA session failed (${reason}); ` +
+            'the switch may ignore legacy clients until its session times out',
+          config,
+          { cause: err },
+        );
       }
     }
+    return config;
+  }
+
+  private async exportConfig(): Promise<Buffer> {
+    await this.refreshToken();
+    const { tlvs } = await this.query(
+      OpCode.LOGIN,
+      [...this.loginTlvs(), { type: TlvType.SYSTEM_CONFIG_GET, value: Buffer.alloc(0) }],
+      this.useSession(),
+      FRAGMENT_SETTLE_MS,
+    );
+    const chunks = tlvs.filter((t) => t.type === TlvType.SYSTEM_CONFIG_GET).map((t) => t.value);
+    if (!chunks.length) throw new Error('config export: no data TLV in response');
+    return Buffer.concat(chunks);
+  }
+
+  /**
+   * Clear the temporary session, then log back in over the legacy transport.
+   * If the clear fails the switch is still session-locked and ignores legacy
+   * traffic, so the legacy login is skipped rather than left to time out.
+   */
+  private async endTemporarySession(): Promise<void> {
+    await this.logout();
+    await this.legacyLogin();
   }
 
   /**
