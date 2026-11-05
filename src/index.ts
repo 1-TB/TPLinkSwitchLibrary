@@ -1,9 +1,12 @@
-export { SwitchClient } from './client.js';
+export { SwitchClient, SessionCleanupError } from './client.js';
+export { UdpTransport, resolveInterface } from './transport.js';
 export { discoverSwitches } from './discovery.js';
 export { encode, decode } from './cipher.js';
+export { newSessionKey, rsaEncryptSessionKey, sessionRC4, RSA_SMALL_MODULUS, RSA_BIG_MODULUS, RSA_OK } from './session.js';
 export * from './types.js';
 export {
   assemblePacket,
+  assembleFragments,
   splitPacket,
   packHeader,
   unpackHeader,

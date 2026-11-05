@@ -53,8 +53,35 @@ await client.setVlan({
 });
 
 await client.save();
-client.close();
+await client.close();
 ```
+
+## Official binary config backup
+
+`backupConfig()` implements the official legacy config backup — the exact bytes
+the official Easy Smart Configuration Utility saves with "Backup Config".
+Verified byte-identical against the utility's own `.cfg` output on a TL-SG1024DE v7.
+
+```ts
+const cfg = await client.backupConfig(); // Buffer, e.g. 2640 bytes on SG1024DE
+import { writeFile } from 'node:fs/promises';
+await writeFile('office-switch.cfg', cfg);
+```
+
+On 2023+ firmware the export requires an RSA session key (TLV 528). While an
+RSA session is active the switch ignores legacy (static RC4) traffic, which
+breaks legacy-only tools like the pklaus/smrt stats dumper for minutes to
+hours, so `login()` uses the legacy transport unless you opt in:
+
+```ts
+new SwitchClient({ switchMac, security: 'auto' }); // 'legacy' (default) | 'auto' | 'rsa'
+```
+
+With the default, `backupConfig()` opens a temporary RSA session, clears it
+(empty TLV 528, ACKed with 4098) and logs back in over the legacy transport.
+With `'auto'` or `'rsa'`, the session stays open until `logout()` or
+`close()` clears it. The negotiated mode is exposed as `client.securityMode`
+(`'rsa-big' | 'rsa-small' | 'legacy'`).
 
 ## Supported operations
 
@@ -70,6 +97,7 @@ client.close();
 - Loop prevention
 - Cable test
 - PoE system/port/extend/recovery helpers for PoE-capable models
+- Official legacy config backup (`backupConfig`) with RSA session-key transport
 - Save, reboot, and factory reset actions
 
 ## Notes

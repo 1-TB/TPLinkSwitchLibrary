@@ -1,7 +1,9 @@
 import dgram from 'node:dgram';
 import os from 'node:os';
 import { decode, encode } from './cipher.js';
-import { HEADER_LENGTH, splitPacket } from './protocol.js';
+import { assembleFragments, HEADER_LENGTH, PACKET_END, packHeader, splitPacket } from './protocol.js';
+import { sessionRC4 } from './session.js';
+import { PacketHeader } from './types.js';
 
 export const SWITCH_PORT = 29808;
 export const CLIENT_PORT = 29809;
@@ -41,6 +43,7 @@ export class UdpTransport {
   private waiters: Array<(b: Buffer) => void> = [];
   private ready: Promise<void>;
   private closed = false;
+  private sessionKey: string | null = null;
 
   constructor(interfaceName?: string) {
     this.host = resolveInterface(interfaceName);
@@ -48,13 +51,8 @@ export class UdpTransport {
     this.recv_ = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
     this.recv_.on('message', (msg) => {
-      let plain: Buffer;
-      try {
-        plain = decode(msg);
-      } catch {
-        return;
-      }
-      if (plain.length < HEADER_LENGTH) return;
+      const plain = this.decrypt(msg);
+      if (!plain || plain.length < HEADER_LENGTH) return;
       // ignore own outgoing broadcast echo: client sends opcodes 0/1/3
       const op = plain.readInt8(1);
       if (op !== 2 && op !== 4) return;
@@ -83,9 +81,25 @@ export class UdpTransport {
     await this.ready;
   }
 
-  async send(packet: Buffer): Promise<void> {
+  /** Switch between legacy static RC4 and the RSA session cipher (null = legacy). */
+  setSessionCipher(key: string | null): void {
+    this.sessionKey = key;
+  }
+
+  /** Try the legacy cipher first, then the session cipher when one is active. */
+  private decrypt(raw: Buffer): Buffer | null {
+    const d1 = decode(raw);
+    if (d1.length >= 2 && d1[0] === 1 && d1[1] < 5) return d1;
+    if (this.sessionKey) {
+      const d2 = sessionRC4(raw, this.sessionKey);
+      if (d2.length >= 2 && d2[0] === 1 && d2[1] < 5) return d2;
+    }
+    return null;
+  }
+
+  async send(packet: Buffer, useSession = false): Promise<void> {
     await this.ready;
-    const enc = encode(packet);
+    const enc = useSession && this.sessionKey ? sessionRC4(packet, this.sessionKey) : encode(packet);
     await new Promise<void>((resolve, reject) => {
       this.send_.send(enc, 0, enc.length, SWITCH_PORT, BROADCAST_ADDR, (err) => {
         if (err) reject(err); else resolve();
@@ -125,21 +139,64 @@ export class UdpTransport {
     return out;
   }
 
-  // assembles fragmented responses keyed by sequenceId
-  async receiveAssembled(timeoutMs: number, sequenceId?: number): Promise<Buffer> {
+  // Assembles fragmented responses keyed by sequenceId.
+  // Fragments arrive with fragmentOffset counting down to 0 on the last one,
+  // and the switch sends each fragment twice. Collection ends once offset 0
+  // and every offset above it (up to the highest seen) are in, and no new
+  // fragment has arrived for settleMs. If the deadline passes first, this
+  // throws instead of returning a partial reply.
+  // Returns a well-formed packet: last fragment's header + all payloads.
+  async receiveAssembled(timeoutMs: number, sequenceId?: number, settleMs = 0): Promise<Buffer> {
     const deadline = Date.now() + timeoutMs;
-    const chunks: Buffer[] = [];
+    const fragments = new Map<number, Buffer>();
     let expectedSeq: number | null = sequenceId ?? null;
+    let finalHeader: PacketHeader | null = null;
+    let maxOffset = 0;
+    let lastArrival = 0;
+    const missing = (): number[] => {
+      const out: number[] = [];
+      for (let o = maxOffset; o >= 0; o--) if (!fragments.has(o)) out.push(o);
+      return out;
+    };
+    const incomplete = (): Error =>
+      new Error(
+        `receive timed out after ${timeoutMs}ms with an incomplete fragmented reply ` +
+          `(missing fragment offsets ${missing().join(', ')})`,
+      );
     while (true) {
-      const remain = Math.max(0, deadline - Date.now());
-      const pkt = await this.receive(remain || 1);
-      const { header } = splitPacket(pkt);
+      const complete = finalHeader !== null && missing().length === 0;
+      const waitUntil = complete ? Math.min(lastArrival + settleMs, deadline) : deadline;
+      const remain = waitUntil - Date.now();
+      if (remain <= 0) {
+        if (complete) break;
+        if (fragments.size) throw incomplete();
+        throw new Error(`receive timed out after ${timeoutMs}ms`);
+      }
+      let pkt: Buffer;
+      try {
+        pkt = await this.receive(remain);
+      } catch (err) {
+        if (complete) break;
+        if (fragments.size) throw incomplete();
+        throw err;
+      }
+      let header: PacketHeader;
+      try {
+        ({ header } = splitPacket(pkt));
+      } catch {
+        continue;
+      }
       if (expectedSeq === null) expectedSeq = header.sequenceId;
       else if (header.sequenceId !== expectedSeq) continue;
-      chunks.push(pkt);
-      if (header.fragmentOffset === 0) break;
+      const offset = header.fragmentOffset;
+      if (offset < 0 || fragments.has(offset)) continue; // duplicate copy
+      fragments.set(offset, pkt);
+      if (offset > maxOffset) maxOffset = offset;
+      if (offset === 0) finalHeader = header;
+      lastArrival = Date.now();
     }
-    return chunks[chunks.length - 1];
+    const payload = assembleFragments([...fragments.values()]);
+    return Buffer.concat([packHeader(finalHeader!), payload, PACKET_END]);
   }
 
   close(): void {

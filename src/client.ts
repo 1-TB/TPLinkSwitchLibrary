@@ -38,6 +38,7 @@ import {
   unpackTlvs,
 } from './protocol.js';
 import { UdpTransport } from './transport.js';
+import { RSA_BIG_MODULUS, RSA_OK, RSA_SMALL_MODULUS, newSessionKey, rsaEncryptSessionKey } from './session.js';
 import {
   BandwidthConfig,
   BandwidthEntry,
@@ -58,6 +59,7 @@ import {
   PvidConfig,
   QosConfig,
   QosPriority,
+  SecurityMode,
   StormControlEntry,
   SwitchClientOptions,
   SwitchConfig,
@@ -67,12 +69,43 @@ import {
   VlanConfig,
 } from './types.js';
 
+/**
+ * How long to keep listening after a fragmented reply looks complete. The
+ * switch sends every fragment twice ~100ms apart, so this window lets the
+ * second copy fill in a fragment whose first copy was lost.
+ */
+const FRAGMENT_SETTLE_MS = 250;
+
+/** The switch adopted the session key but rejected the credentials. */
+class LoginRejectedError extends Error {}
+
+/**
+ * Thrown by backupConfig() when the config was downloaded but closing the
+ * temporary RSA session afterwards failed. The backup is still available on
+ * `config`; the switch may ignore legacy clients until its session times out.
+ */
+export class SessionCleanupError extends Error {
+  constructor(
+    message: string,
+    readonly config: Buffer,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = 'SessionCleanupError';
+  }
+}
+
 export class SwitchClient extends EventEmitter {
   private opts: Required<SwitchClientOptions>;
   private transport?: UdpTransport;
   private switchMac: Buffer;
   private sequenceId = Math.floor(Math.random() * 1000);
   private tokenId = 0;
+  private sessionKey: string | null = null;
+  /** Set once both RSA handshakes failed, so later calls skip the timeouts. */
+  private rsaUnsupported = false;
+  /** Transport security negotiated by login(). */
+  securityMode: SecurityMode = 'legacy';
 
   constructor(opts: SwitchClientOptions) {
     super();
@@ -82,6 +115,7 @@ export class SwitchClient extends EventEmitter {
       username: opts.username ?? 'admin',
       password: opts.password ?? 'admin',
       timeout: opts.timeout ?? 2000,
+      security: opts.security ?? 'legacy',
     };
     this.switchMac = serializeMac(opts.switchMac);
   }
@@ -115,14 +149,36 @@ export class SwitchClient extends EventEmitter {
     };
   }
 
-  private async query(opCode: OpCode, tlvs: TlvEntry[]): Promise<{ header: PacketHeader; tlvs: TlvEntry[] }> {
+  /** Send a request and return the raw reply. Does not throw on error codes. */
+  private async queryRaw(
+    opCode: OpCode,
+    tlvs: TlvEntry[],
+    useSession: boolean,
+    settleMs = 0,
+  ): Promise<{ header: PacketHeader; tlvs: TlvEntry[] }> {
     const t = await this.transport_();
     const header = this.buildHeader(opCode, t.host.mac);
     const packet = assemblePacket(header, tlvs);
-    await t.send(packet);
-    let reply: Buffer;
+    await t.send(packet, useSession);
+    const reply = await t.receiveAssembled(this.opts.timeout, header.sequenceId, settleMs);
+    const { header: rh, payload } = splitPacket(reply);
+    this.tokenId = rh.tokenId;
+    return { header: rh, tlvs: unpackTlvs(payload) };
+  }
+
+  private useSession(): boolean {
+    return this.securityMode !== 'legacy' && this.sessionKey !== null;
+  }
+
+  private async query(
+    opCode: OpCode,
+    tlvs: TlvEntry[],
+    useSession = this.useSession(),
+    settleMs = 0,
+  ): Promise<{ header: PacketHeader; tlvs: TlvEntry[] }> {
+    let res: { header: PacketHeader; tlvs: TlvEntry[] };
     try {
-      reply = await t.receiveAssembled(this.opts.timeout, header.sequenceId);
+      res = await this.queryRaw(opCode, tlvs, useSession, settleMs);
     } catch (err) {
       // Surface timeouts via a dedicated event (Phase 4 spec).
       if (err instanceof Error && /timed out/i.test(err.message)) {
@@ -130,14 +186,12 @@ export class SwitchClient extends EventEmitter {
       }
       throw err;
     }
-    const { header: rh, payload } = splitPacket(reply);
-    this.tokenId = rh.tokenId;
-    if (rh.errorCode !== 0) {
-      const err = new Error(`switch returned error code ${rh.errorCode}`);
+    if (res.header.errorCode !== 0) {
+      const err = new Error(`switch returned error code ${res.header.errorCode}`);
       this.emit('error', err);
       throw err;
     }
-    return { header: rh, tlvs: unpackTlvs(payload) };
+    return res;
   }
 
   private async refreshToken(): Promise<void> {
@@ -151,12 +205,99 @@ export class SwitchClient extends EventEmitter {
     ];
   }
 
+  /**
+   * Negotiate an RSA session key (TLV 528) and verify the switch adopted it.
+   * The ACK alone doesn't prove adoption — e.g. the TL-SG1024DE v7 ACKs the
+   * 1024-bit key but only activates the session for the 64-bit key — so the
+   * session is confirmed with an encrypted token GET before use.
+   */
+  private async tryRSASession(modulus: Buffer, mode: SecurityMode): Promise<boolean> {
+    const t = await this.transport_();
+    const key = newSessionKey();
+    let adopted = false;
+    let established = false;
+    this.sessionKey = key;
+    t.setSessionCipher(key);
+    try {
+      const rsa = rsaEncryptSessionKey(key, modulus);
+      // The handshake itself always goes out static-encrypted.
+      const ack = await this.queryRaw(OpCode.LOGIN, [{ type: TlvType.RSA_KEY, value: rsa }], false);
+      if (ack.header.errorCode !== RSA_OK) return false;
+      // A reply to a session-encrypted request proves the switch adopted the key;
+      // a switch that only ACKed it ignores the request and this times out.
+      const token = await this.queryRaw(
+        OpCode.GET,
+        [{ type: TlvType.GET_TOKEN_ID, value: Buffer.alloc(0) }],
+        true,
+      );
+      adopted = true;
+      if (token.header.errorCode !== 0) return false;
+      const auth = await this.queryRaw(OpCode.LOGIN, this.loginTlvs(), true);
+      if (auth.header.errorCode !== 0) {
+        throw new LoginRejectedError(`switch rejected login (error code ${auth.header.errorCode})`);
+      }
+      this.securityMode = mode;
+      established = true;
+      return true;
+    } catch (err) {
+      // Bad credentials are a real failure, not a reason to try another mode.
+      if (err instanceof LoginRejectedError) throw err;
+      return false;
+    } finally {
+      if (!established) {
+        // Don't leave the switch session-locked after a half-finished handshake.
+        if (adopted) await this.sendSessionClear().catch(() => undefined);
+        this.clearLocalSession();
+      }
+    }
+  }
+
+  /** Try an RSA session with the 1024-bit key, then the 64-bit one. */
+  private async startSession(): Promise<boolean> {
+    if (this.rsaUnsupported) return false;
+    if (await this.tryRSASession(RSA_BIG_MODULUS, 'rsa-big')) return true;
+    if (await this.tryRSASession(RSA_SMALL_MODULUS, 'rsa-small')) return true;
+    this.rsaUnsupported = true;
+    return false;
+  }
+
+  private async legacyLogin(): Promise<void> {
+    await this.query(OpCode.GET, [{ type: TlvType.GET_TOKEN_ID, value: Buffer.alloc(0) }], false);
+    await this.query(OpCode.LOGIN, this.loginTlvs(), false);
+  }
+
+  private clearLocalSession(): void {
+    this.sessionKey = null;
+    this.securityMode = 'legacy';
+    this.transport?.setSessionCipher(null);
+  }
+
+  /** Empty TLV 528, always static-encrypted. Throws unless the switch ACKs it. */
+  private async sendSessionClear(): Promise<void> {
+    const res = await this.queryRaw(OpCode.LOGIN, [{ type: TlvType.RSA_KEY, value: Buffer.alloc(0) }], false);
+    if (res.header.errorCode !== RSA_OK) {
+      throw new Error(`switch did not acknowledge session clear (error code ${res.header.errorCode})`);
+    }
+  }
+
   async login(): Promise<void> {
-    // Matches pc-smrt: refresh token, then send LOGIN with just credentials.
-    // This establishes the session; subsequent reads use plain GET with the
-    // inherited token_id. Writes re-run refresh+LOGIN with credentials+payload.
-    await this.refreshToken();
-    await this.query(OpCode.LOGIN, this.loginTlvs());
+    // The transport is chosen by opts.security (default 'legacy'). RSA is opt-in
+    // because an RSA session makes the switch ignore legacy-only tools until it
+    // is cleared. backupConfig() opens a temporary session when it needs one.
+    await this.transport_();
+    this.clearLocalSession();
+    try {
+      if (this.opts.security !== 'legacy') {
+        if (await this.startSession()) return;
+        if (this.opts.security === 'rsa') {
+          throw new Error('switch did not accept an RSA session key (tried 1024-bit and 64-bit)');
+        }
+      }
+      await this.legacyLogin();
+    } catch (err) {
+      if (err instanceof LoginRejectedError) this.emit('error', err);
+      throw err;
+    }
   }
 
   private async authedSet(tlvs: TlvEntry[]): Promise<{ header: PacketHeader; tlvs: TlvEntry[] }> {
@@ -534,6 +675,87 @@ export class SwitchClient extends EventEmitter {
 
   // ---------- Full config + lifecycle ----------
 
+  /**
+   * Download the official binary config backup — the same blob the Easy Smart
+   * Configuration Utility saves via "Backup Config" (TLV 768, the raw config
+   * image). Requires a successful login(). On 2023+ firmware the export only
+   * works over the RSA session transport: if login() didn't open one, this
+   * opens a temporary session, and clears it and logs back in over the legacy
+   * transport afterwards. If the export fails, that error is thrown even when
+   * the cleanup fails too. If the export succeeds but the cleanup fails, a
+   * SessionCleanupError carrying the downloaded config is thrown.
+   * The reply arrives fragmented (fragmentOffset counts down to 0); the
+   * transport waits for every fragment and throws if any is missing.
+   */
+  async backupConfig(): Promise<Buffer> {
+    const temporary = !this.useSession() && (await this.startSession());
+    let config: Buffer;
+    try {
+      config = await this.exportConfig();
+    } catch (err) {
+      // Keep the export error; a cleanup failure must not replace it.
+      if (temporary) await this.endTemporarySession().catch(() => undefined);
+      throw err;
+    }
+    if (temporary) {
+      try {
+        await this.endTemporarySession();
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new SessionCleanupError(
+          `config downloaded, but closing the temporary RSA session failed (${reason}); ` +
+            'the switch may ignore legacy clients until its session times out',
+          config,
+          { cause: err },
+        );
+      }
+    }
+    return config;
+  }
+
+  private async exportConfig(): Promise<Buffer> {
+    await this.refreshToken();
+    const { tlvs } = await this.query(
+      OpCode.LOGIN,
+      [...this.loginTlvs(), { type: TlvType.SYSTEM_CONFIG_GET, value: Buffer.alloc(0) }],
+      this.useSession(),
+      FRAGMENT_SETTLE_MS,
+    );
+    const chunks = tlvs.filter((t) => t.type === TlvType.SYSTEM_CONFIG_GET).map((t) => t.value);
+    if (!chunks.length) throw new Error('config export: no data TLV in response');
+    return Buffer.concat(chunks);
+  }
+
+  /**
+   * Clear the temporary session, then log back in over the legacy transport.
+   * If the clear fails the switch is still session-locked and ignores legacy
+   * traffic, so the legacy login is skipped rather than left to time out.
+   */
+  private async endTemporarySession(): Promise<void> {
+    await this.logout();
+    await this.legacyLogin();
+  }
+
+  /**
+   * Clear the switch's RSA session state so legacy (static RC4) clients can
+   * talk to it again. While an RSA session is active the switch ignores legacy
+   * traffic for minutes to hours; sending the session-key TLV with an empty
+   * value unlocks it immediately (the switch ACKs with 4098, same as a real
+   * handshake). Verified live on TL-SG105E and TL-SG108E.
+   * This is sent even when this client has no session, so it also clears a
+   * lock left behind by another process. Throws if the switch doesn't ACK it;
+   * local session state is reset either way.
+   */
+  async logout(): Promise<void> {
+    try {
+      // Sent static-encrypted: the TLV 528 handshake path accepts the legacy
+      // cipher even while the switch is session-locked (new clients need in).
+      await this.sendSessionClear();
+    } finally {
+      this.clearLocalSession();
+    }
+  }
+
   async getFullConfig(): Promise<SwitchConfig> {
     const info = await this.getInfo();
     const ports = await this.getPorts();
@@ -556,8 +778,18 @@ export class SwitchClient extends EventEmitter {
     await this.authedSet([{ type: TlvType.REBOOT, value: Buffer.from([1]) }]);
   }
 
-  close(): void {
-    this.transport?.close();
-    this.transport = undefined;
+  /** Clear any active RSA session (best effort), then close the sockets. */
+  async close(): Promise<void> {
+    const t = this.transport;
+    if (!t) return;
+    if (this.useSession()) {
+      try {
+        await this.logout();
+      } catch {
+        // Closing must not fail because the switch is unreachable.
+      }
+    }
+    t.close();
+    if (this.transport === t) this.transport = undefined;
   }
 }
