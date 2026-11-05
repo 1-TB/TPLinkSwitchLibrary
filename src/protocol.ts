@@ -104,16 +104,23 @@ export function splitPacket(data: Buffer): { header: PacketHeader; payload: Buff
  * Concatenate the payloads of a fragmented response. `fragmentOffset` counts
  * down to 0 on the last fragment (markpash: "number of fragments - 1"), so
  * fragments are ordered descending. The switch sends every fragment twice
- * (~100ms apart); duplicates are dropped by fragmentOffset.
+ * (~100ms apart); duplicates are dropped by fragmentOffset. The end marker is
+ * stripped only where a fragment actually carries one, so no payload bytes
+ * are lost if intermediate fragments omit it.
  */
 export function assembleFragments(packets: Buffer[]): Buffer {
   const seen = new Set<number>();
   const parts: Array<{ offset: number; payload: Buffer }> = [];
   for (const pkt of packets) {
-    const { header, payload } = splitPacket(pkt);
+    if (pkt.length < HEADER_LENGTH) throw new Error('packet too short');
+    const header = unpackHeader(pkt.subarray(0, HEADER_LENGTH));
     if (seen.has(header.fragmentOffset)) continue;
     seen.add(header.fragmentOffset);
-    parts.push({ offset: header.fragmentOffset, payload });
+    const hasEnd =
+      pkt.length >= HEADER_LENGTH + PACKET_END.length &&
+      pkt.subarray(pkt.length - PACKET_END.length).equals(PACKET_END);
+    const end = hasEnd ? pkt.length - PACKET_END.length : pkt.length;
+    parts.push({ offset: header.fragmentOffset, payload: Buffer.from(pkt.subarray(HEADER_LENGTH, end)) });
   }
   parts.sort((a, b) => b.offset - a.offset);
   return Buffer.concat(parts.map((p) => p.payload));

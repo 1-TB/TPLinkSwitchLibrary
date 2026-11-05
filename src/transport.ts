@@ -139,29 +139,64 @@ export class UdpTransport {
     return out;
   }
 
-  // assembles fragmented responses keyed by sequenceId.
-  // Fragments arrive with fragmentOffset counting down to 0 on the last one;
-  // the switch sends each fragment twice, so assembleFragments dedupes.
+  // Assembles fragmented responses keyed by sequenceId.
+  // Fragments arrive with fragmentOffset counting down to 0 on the last one,
+  // and the switch sends each fragment twice. Collection ends once offset 0
+  // and every offset above it (up to the highest seen) are in, and no new
+  // fragment has arrived for settleMs. If the deadline passes first, this
+  // throws instead of returning a partial reply.
   // Returns a well-formed packet: last fragment's header + all payloads.
-  async receiveAssembled(timeoutMs: number, sequenceId?: number): Promise<Buffer> {
+  async receiveAssembled(timeoutMs: number, sequenceId?: number, settleMs = 0): Promise<Buffer> {
     const deadline = Date.now() + timeoutMs;
-    const chunks: Buffer[] = [];
+    const fragments = new Map<number, Buffer>();
     let expectedSeq: number | null = sequenceId ?? null;
-    let lastHeader: PacketHeader | null = null;
+    let finalHeader: PacketHeader | null = null;
+    let maxOffset = 0;
+    let lastArrival = 0;
+    const missing = (): number[] => {
+      const out: number[] = [];
+      for (let o = maxOffset; o >= 0; o--) if (!fragments.has(o)) out.push(o);
+      return out;
+    };
+    const incomplete = (): Error =>
+      new Error(
+        `receive timed out after ${timeoutMs}ms with an incomplete fragmented reply ` +
+          `(missing fragment offsets ${missing().join(', ')})`,
+      );
     while (true) {
-      const remain = Math.max(0, deadline - Date.now());
-      const pkt = await this.receive(remain || 1);
-      const { header } = splitPacket(pkt);
+      const complete = finalHeader !== null && missing().length === 0;
+      const waitUntil = complete ? Math.min(lastArrival + settleMs, deadline) : deadline;
+      const remain = waitUntil - Date.now();
+      if (remain <= 0) {
+        if (complete) break;
+        if (fragments.size) throw incomplete();
+        throw new Error(`receive timed out after ${timeoutMs}ms`);
+      }
+      let pkt: Buffer;
+      try {
+        pkt = await this.receive(remain);
+      } catch (err) {
+        if (complete) break;
+        if (fragments.size) throw incomplete();
+        throw err;
+      }
+      let header: PacketHeader;
+      try {
+        ({ header } = splitPacket(pkt));
+      } catch {
+        continue;
+      }
       if (expectedSeq === null) expectedSeq = header.sequenceId;
       else if (header.sequenceId !== expectedSeq) continue;
-      chunks.push(pkt);
-      if (header.fragmentOffset === 0) {
-        lastHeader = header;
-        break;
-      }
+      const offset = header.fragmentOffset;
+      if (offset < 0 || fragments.has(offset)) continue; // duplicate copy
+      fragments.set(offset, pkt);
+      if (offset > maxOffset) maxOffset = offset;
+      if (offset === 0) finalHeader = header;
+      lastArrival = Date.now();
     }
-    const payload = assembleFragments(chunks);
-    return Buffer.concat([packHeader(lastHeader!), payload, PACKET_END]);
+    const payload = assembleFragments([...fragments.values()]);
+    return Buffer.concat([packHeader(finalHeader!), payload, PACKET_END]);
   }
 
   close(): void {

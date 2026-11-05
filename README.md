@@ -53,7 +53,7 @@ await client.setVlan({
 });
 
 await client.save();
-client.close();
+await client.close();
 ```
 
 ## Official binary config backup
@@ -68,15 +68,20 @@ import { writeFile } from 'node:fs/promises';
 await writeFile('office-switch.cfg', cfg);
 ```
 
-On 2023+ firmware the export requires an RSA session key (TLV 528); `login()`
-negotiates it automatically (1024-bit RSA, then 64-bit, then the legacy static
-cipher for old firmware). The negotiated mode is exposed as `client.securityMode`
-(`'rsa-big' | 'rsa-small' | 'legacy'`).
+On 2023+ firmware the export requires an RSA session key (TLV 528). While an
+RSA session is active the switch ignores legacy (static RC4) traffic, which
+breaks legacy-only tools like the pklaus/smrt stats dumper for minutes to
+hours, so `login()` uses the legacy transport unless you opt in:
 
-While an RSA session is active the switch ignores legacy (static RC4) traffic
-— which breaks legacy-only tools like the pklaus/smrt stats dumper for minutes
-to hours. `logout()` clears the session (empty TLV 528, ACKed with 4098) and
-restores legacy access immediately; call it after `backupConfig()`.
+```ts
+new SwitchClient({ switchMac, security: 'auto' }); // 'legacy' (default) | 'auto' | 'rsa'
+```
+
+With the default, `backupConfig()` opens a temporary RSA session, clears it
+(empty TLV 528, ACKed with 4098) and logs back in over the legacy transport.
+With `'auto'` or `'rsa'`, the session stays open until `logout()` or
+`close()` clears it. The negotiated mode is exposed as `client.securityMode`
+(`'rsa-big' | 'rsa-small' | 'legacy'`).
 
 ## Supported operations
 

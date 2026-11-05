@@ -10,6 +10,16 @@ export enum OpCode {
 /** Transport security negotiated at login. */
 export type SecurityMode = 'rsa-big' | 'rsa-small' | 'legacy';
 
+/**
+ * How login() picks a transport.
+ * - 'legacy' (default): static RC4 only. Never puts the switch into RSA
+ *   session mode, so legacy-only tools keep working.
+ * - 'auto': try an RSA session (1024-bit, then 64-bit), fall back to legacy.
+ * - 'rsa': require an RSA session; login() throws if the switch refuses it.
+ * backupConfig() opens a temporary RSA session on its own when needed.
+ */
+export type SecurityPreference = 'legacy' | 'auto' | 'rsa';
+
 export enum TlvType {
   // System info
   TYPE = 1,
@@ -310,4 +320,5 @@ export interface SwitchClientOptions {
   username?: string;
   password?: string;
   timeout?: number;
+  security?: SecurityPreference;
 }
